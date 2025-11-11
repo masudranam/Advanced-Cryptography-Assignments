@@ -1,155 +1,120 @@
-#!/usr/bin/env python3
-"""XorWeyMix PRNG
-A lightweight, non-cryptographic pseudorandom number generator combining:
- - a xorshift-style state update,
- - a Weyl sequence increment (adds a fixed odd constant modulo 2^64),
- - a nonlinear scramble step inspired by SplitMix/PCG mix functions.
 
-This is intended for simulation/games/experimentation only — NOT for cryptographic use.
-
-API:
-    pr = XorWeyMixPRNG(seed)
-    pr.rand_uint64()    -> 64-bit unsigned integer
-    pr.rand()           -> float in [0, 1)
-    pr.randint(a, b)    -> integer in [a, b]
-    pr.choice(seq)      -> random element from sequence
-    pr.shuffle(list)    -> in-place shuffle
-    pr.seed(seed)       -> reseed the generator
-
-Design notes:
- - Uses a 128-bit internal state split into two uint64 values (state and weyl).
- - state evolves with xorshift-like ops then is mixed with weyl and scrambled.
- - The scramble uses shifts and multiplications to spread bits.
- - A single 'step' returns a 64-bit value.
- - Period is large (theoretical: period affected by Weyl increment and state transitions),
-   but no formal proof provided. Statistical testing (e.g., TestU01/Dieharder) is recommended
-   if used for serious simulations.
-"""
-
-from typing import Sequence, Any
 import time
-import struct
+from typing import Sequence, Any
 
-MASK64 = (1 << 64) - 1
+_U64_MASK = (1 << 64) - 1
 
-def _rotl64(x, k):
-    return ((x << k) & MASK64) | (x >> (64 - k))
 
-class XorWeyMixPRNG:
-    """Simple 64-bit PRNG combining xorshift, Weyl increment, and nonlinear mixing."""
-    def __init__(self, seed: int = None):
+def _rotl64(x: int, r: int) -> int:
+    """Rotate left (64-bit)."""
+    return ((x << r) & _U64_MASK) | (x >> (64 - r))
+
+
+class XorWeyGen:
+
+    def __init__(self, seed: int | None = None):
         if seed is None:
-            # use high-resolution time-based seed if none provided
-            seed = int(time.time_ns()) & MASK64
-        self.seed(seed)
+            seed = time.time_ns() & _U64_MASK
+        self.reseed(seed)
 
-    def seed(self, seed: int):
-        # initialize two 64-bit states derived from the seed using splitmix64-like mixing
-        def splitmix64(x):
-            x = (x + 0x9E3779B97F4A7C15) & MASK64
-            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & MASK64
-            x = (x ^ (x >> 27)) * 0x94D049BB133111EB & MASK64
-            return x ^ (x >> 31)
+    def _mix64(self, x: int) -> int:
+        """SplitMix-style bit mixing."""
+        x = (x + 0x9E3779B97F4A7C15) & _U64_MASK
+        x ^= x >> 30
+        x = (x * 0xBF58476D1CE4E5B9) & _U64_MASK
+        x ^= x >> 27
+        x = (x * 0x94D049BB133111EB) & _U64_MASK
+        x ^= x >> 31
+        return x & _U64_MASK
 
-        s = seed & MASK64
-        self._state = splitmix64(s) or 1  # avoid zero state
-        self._weyl = splitmix64(s ^ 0xFACEB00CDEADBEEF) or 1
-        # choose a Weyl step (must be odd); it's fixed per instance but could be randomized
-        self._weyl_step = 0x9E3779B97F4A7C15  # golden ratio-based
-        # small counter to avoid trivial cycles
-        self._counter = 0
+    def reseed(self, seed: int):
+        """Reset internal state from seed."""
+        seed &= _U64_MASK
+        self._state = self._mix64(seed) or 1
+        self._weyl = self._mix64(seed ^ 0xA5A5A5A5A5A5A5A5) or 1
+        self._weyl_step = 0x9E3779B97F4A7C15  # odd constant
+        self._count = 0
 
-    def _step(self) -> int:
-        """Advance internal state and produce a 64-bit raw output."""
-        # xorshift-ish update to _state
-        x = self._state
-        x ^= (x << 13) & MASK64
-        x ^= (x >> 7) & MASK64
-        x ^= (x << 17) & MASK64
-        x &= MASK64
-        self._state = x if x != 0 else 0xFFFFFFFFFFFFFFFF  # avoid zero sticky state
+    def _advance(self) -> int:
+        """Single state transition, returning a 64-bit integer."""
+        s = self._state
+        s ^= (s << 13) & _U64_MASK
+        s ^= (s >> 7) & _U64_MASK
+        s ^= (s << 17) & _U64_MASK
+        s &= _U64_MASK
+        self._state = s or 0xFFFFFFFFFFFFFFFF
 
-        # advance Weyl sequence (add constant modulo 2^64)
-        self._weyl = (self._weyl + self._weyl_step) & MASK64
+        self._weyl = (self._weyl + self._weyl_step) & _U64_MASK
+        z = (s + self._weyl + self._count) & _U64_MASK
+        self._count = (self._count + 1) & _U64_MASK
 
-        # combine components
-        z = (x + self._weyl + self._counter) & MASK64
-        self._counter = (self._counter + 1) & MASK64
+        # nonlinear output mixing
+        z ^= z >> 30
+        z = (z * 0xBF58476D1CE4E5B9) & _U64_MASK
+        z ^= z >> 27
+        z = (z * 0x94D049BB133111EB) & _U64_MASK
+        z ^= z >> 31
+        return z & _U64_MASK
 
-        # nonlinear scramble (inspired by SplitMix and PCG)
-        z = (z ^ (z >> 30)) & MASK64
-        z = (z * 0xBF58476D1CE4E5B9) & MASK64
-        z = (z ^ (z >> 27)) & MASK64
-        z = (z * 0x94D049BB133111EB) & MASK64
-        z = z ^ (z >> 31)
-        return z & MASK64
+    # === Public API ===
 
-    def rand_uint64(self) -> int:
-        """Return a 64-bit unsigned integer."""
-        return self._step()
+    def next_u64(self) -> int:
+        """Return a raw 64-bit unsigned integer."""
+        return self._advance()
 
-    def rand(self) -> float:
-        """Return a float in [0, 1). Uses 53 bits of precision (IEEE double mantissa)."""
-        # take top 53 bits of a 64-bit random value
-        rv = self.rand_uint64() >> 11  # 64 - 53 = 11
-        return rv / float(1 << 53)
+    def random(self) -> float:
+        """Return float in [0, 1) with 53-bit precision."""
+        return (self.next_u64() >> 11) / float(1 << 53)
 
     def randint(self, a: int, b: int) -> int:
-        """Return integer in [a, b] inclusive. Uses rejection sampling to avoid bias."""
+        """Random integer in [a, b]."""
         if a > b:
-            raise ValueError("a must be <= b")
-        width = b - a + 1
-        if width <= 0:
-            # width too large for python int bounds? fallback
-            return a + (self.rand_uint64() % (b - a + 1))
-        # rejection sampling
-        mask = (1 << (width.bit_length())) - 1
+            raise ValueError("Invalid range: a > b")
+        rng = b - a + 1
+        mask = (1 << rng.bit_length()) - 1
         while True:
-            r = self.rand_uint64() & mask
-            if r < width:
-                return a + r
+            val = self.next_u64() & mask
+            if val < rng:
+                return a + val
 
     def choice(self, seq: Sequence[Any]) -> Any:
+        """Return random element from non-empty sequence."""
         if not seq:
-            raise IndexError('choice from empty sequence')
-        idx = self.randint(0, len(seq)-1)
-        return seq[idx]
+            raise IndexError("Cannot choose from empty sequence")
+        return seq[self.randint(0, len(seq) - 1)]
 
-    def shuffle(self, lst):
-        """In-place Fisher-Yates shuffle."""
-        n = len(lst)
-        for i in range(n-1, 0, -1):
+    def shuffle(self, arr: list):
+        """Fisher–Yates in-place shuffle."""
+        n = len(arr)
+        for i in range(n - 1, 0, -1):
             j = self.randint(0, i)
-            lst[i], lst[j] = lst[j], lst[i]
+            arr[i], arr[j] = arr[j], arr[i]
 
-# Quick self-test when run as script
-if __name__ == '__main__':
-    pr = XorWeyMixPRNG(123456789)
-    print('Sample uint64s:')
+if __name__ == "__main__":
+    gen = XorWeyGen(123456789)
+    print("Sample uint64 outputs:")
     for _ in range(5):
-        print(hex(pr.rand_uint64()))
-    print('\nSample floats:')
-    for _ in range(5):
-        print(pr.rand())
+        print(hex(gen.next_u64()))
 
-    # basic distribution checks
-    pr = XorWeyMixPRNG(987654321)
-    N = 200000
-    s = 0.0
-    ones = 0
-    zeros = 0
-    topbits = 0
+    print("\nSample float outputs:")
+    for _ in range(5):
+        print(gen.random())
+
+    # Small distribution check
+    N = 200_000
+    ones = zeros = topbit = 0
+    acc = 0.0
+    g2 = XorWeyGen(987654321)
     for _ in range(N):
-        v = pr.rand_uint64()
-        s += (v >> 11) / float(1 << 53)
-        # count low bit distribution
+        v = g2.next_u64()
+        acc += (v >> 11) / float(1 << 53)
         if v & 1:
             ones += 1
         else:
             zeros += 1
-        topbits += (v >> 63) & 1
-    mean = s / N
-    print('\nBasic stats for N=%d' % N)
-    print('mean ~', mean)
-    print('low bit ones:', ones, 'zeros:', zeros)
-    print('top bit ones count:', topbits)
+        topbit += (v >> 63) & 1
+
+    print("\nStats for N =", N)
+    print(f"mean ≈ {acc/N:.6f}")
+    print(f"low bit: ones={ones} zeros={zeros}")
+    print(f"top bit ones: {topbit}")
